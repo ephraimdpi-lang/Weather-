@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Weather Alert Now app icon">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#0f2027"/>
+      <stop offset="100%" stop-color="#2c5364"/>
+    </linearGradient>
+    <linearGradient id="sun" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#fff7a8"/>
+      <stop offset="100%" stop-color="#ffb454"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="120" fill="url(#bg)"/>
+  <circle cx="346" cy="148" r="82" fill="url(#sun)" opacity="0.95"/>
+  <g fill="#dfeff9" opacity="0.9">
+    <ellipse cx="230" cy="276" rx="150" ry="74"/>
+    <ellipse cx="290" cy="328" rx="172" ry="88"/>
+  </g>
+  <g fill="#8be5ff" opacity="0.9">
+    <path d="M166 334c36-12 44-70 80-80 50 16 71 79 130 80-1 42-28 80-70 97H204c-45-4-72-42-38-97z"/>
+  </g>
+  <path d="M176 392c18 0 32 14 32 32H144c0-18 14-32 32-32Z" fill="#8ad3f5" opacity="0.9"/>
+  <path d="M244 392c18 0 32 14 32 32h-64c0-18 14-32 32-32Z" fill="#8ad3f5" opacity="0.9"/>
+  <path d="M312 392c18 0 32 14 32 32h-64c0-18 14-32 32-32Z" fill="#8ad3f5" opacity="0.9"/>
+</svg>
