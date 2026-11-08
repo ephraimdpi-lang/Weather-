@@ -359,8 +359,8 @@ th,td{padding:13px 12px}
     Connecting...
   </div>
   <div class="sub">
-    Weather data: Open-Meteo APIs.<br>
-    Forecast models: ECMWF and ICON, when available.<br>
+    Current Lahore airport observation / nowcast: OPLA METAR.<br>
+    Other locations and forecast outlooks: existing Open-Meteo feeds; ECMWF and ICON model comparison remains unchanged.<br>
     PMD: Official links; no live PMD feed is configured.
   </div>
 </section>
@@ -459,6 +459,8 @@ const state = {
   data:null,
   models:[],
   air:null,
+  metar:null,
+  metarError:false,
   sequence:0,
   lastLoad:0,
   nextAt:0,
@@ -466,7 +468,7 @@ const state = {
 };
 
 function esc(value){
-  return String(value ?? "").replace(/[&<>\"']/g, ch => ({
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
     "&":"&amp;","<":"&lt;",">":"&gt;",
     '"':"&quot;","'":"&#39;"
   })[ch]);
@@ -663,6 +665,10 @@ async function loadWeather(){
 
   const sequence = ++state.sequence;
 
+  // Airport observations are an independent source: start them even if
+  // Open-Meteo is slow or unavailable.
+  loadAirportMetar(sequence);
+
   $("refreshBtn").textContent = "…";
   $("refreshBtn").disabled = true;
 
@@ -734,6 +740,165 @@ async function loadWeather(){
 }
 
 /* =========================
+   LAHORE AIRPORT METAR OBSERVATION
+   Used only when the selected location is Lahore.
+   Forecast/hourly/daily/model data remain on their existing model feeds.
+========================= */
+
+function isLahoreAirportLocation(){
+  return state.name.toLowerCase()==="lahore" &&
+    Math.abs(state.lat-31.5204)<0.15 &&
+    Math.abs(state.lon-74.3587)<0.15;
+}
+
+async function loadAirportMetar(sequence){
+  if(!isLahoreAirportLocation()){
+    state.metar=null;
+    state.metarError=false;
+    return;
+  }
+
+  state.metar=null;
+  state.metarError=false;
+  if(state.data){
+    renderCurrent();
+    renderSummary();
+  }
+
+  try{
+    // RotatePilot explicitly documents browser CORS support. The official
+    // AviationWeather.gov API currently disallows cross-origin browser calls,
+    // so it must not be used as a direct client-side fallback here.
+    const response=await fetchJSON("https://rotatepilot.com/api/v1/metar?icao=OPLA");
+    if(sequence!==state.sequence) return;
+
+    if(!response || response.icao!=="OPLA" || !response.raw){
+      throw new Error("RotatePilot returned no valid OPLA METAR report");
+    }
+
+    state.metar=normalizeAirportMetar(response);
+    state.metarError=false;
+    if(state.data){
+      renderCurrent();
+      renderSummary();
+    }
+  }catch(error){
+    if(sequence!==state.sequence) return;
+    state.metar=null;
+    state.metarError=true;
+    if(state.data){
+      renderCurrent();
+      renderSummary();
+    }
+    console.warn("OPLA METAR unavailable:",error);
+  }
+}
+
+function metarNumber(value){
+  if(value===null || value===undefined || value==="") return null;
+  const number=Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function metarReportDate(value){
+  if(value===null || value===undefined || value==="") return null;
+
+  // RotatePilot returns ISO strings; AviationWeather's obsTime may be
+  // Unix seconds. Handle both seconds and milliseconds defensively.
+  if(typeof value==="number" || (typeof value==="string" && /^\d+(?:\.\d+)?$/.test(value))){
+    const numeric=Number(value);
+    const milliseconds=numeric<1e12 ? numeric*1000 : numeric;
+    const date=new Date(milliseconds);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  const date=new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function normalizeAirportMetar(item){
+  const raw=String(item.raw || item.rawOb || "");
+  const tempC=metarNumber(item.temperatureC ?? item.temp);
+  const dewC=metarNumber(item.dewpointC ?? item.dewp);
+  const direction=item.windDir ?? item.wdir;
+  const speed=metarNumber(item.windSpeedKt ?? item.wspd);
+  const gust=metarNumber(item.windGustKt ?? item.wgst);
+  const visibilitySm=metarNumber(item.visibilitySm ?? item.visibility ?? item.visib);
+
+  // Both APIs expose pressure in hPa under these fields. Do not treat
+  // AviationWeather's altim value as inHg or multiply it by 33.8639.
+  const qnh=metarNumber(item.altimeterHpa ?? item.altim);
+  const wx=String(item.weather ?? item.wxString ?? "").trim();
+
+  const wxNames={
+    HZ:"Haze",FU:"Smoke",BR:"Mist",FG:"Fog",DU:"Dust",SA:"Sand",
+    RA:"Rain",DZ:"Drizzle",TS:"Thunderstorm",SHRA:"Rain showers",
+    SN:"Snow",GR:"Hail",GS:"Small hail",SQ:"Squalls",SS:"Sandstorm",
+    DS:"Duststorm",VC:"Nearby weather"
+  };
+
+  let condition="";
+  if(wx){
+    const codes=wx.match(/(?:\+|-)?(?:VC|MI|PR|BC|DR|BL|SH|TS|FZ)?(?:DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PY|PO|SQ|FC|SS|DS)/g) || [wx];
+    condition=[...new Set(codes.map(code=>{
+      const clean=code.replace(/[+\-]/g,"");
+      const found=Object.keys(wxNames).find(key=>clean.includes(key));
+      return found ? wxNames[found] : code;
+    }))].join(", ");
+  }else{
+    const cloudCodes=raw.match(/\b(?:FEW|SCT|BKN|OVC|VV)\d{3}\b|\b(?:NSC|NCD|SKC|CLR)\b/g) || [];
+    if(cloudCodes.some(x=>x.startsWith("OVC")||x.startsWith("VV"))) condition="Overcast";
+    else if(cloudCodes.some(x=>x.startsWith("BKN"))) condition="Mostly cloudy";
+    else if(cloudCodes.some(x=>x.startsWith("SCT"))) condition="Partly cloudy";
+    else if(cloudCodes.some(x=>x.startsWith("FEW"))) condition="Few clouds";
+    else if(cloudCodes.length) condition="Clear / no significant cloud";
+    else condition="No significant weather reported";
+  }
+
+  let humidity=null;
+  if(tempC!==null && dewC!==null){
+    const magnus=x=>6.112*Math.exp((17.67*x)/(x+243.5));
+    humidity=Math.round(100*magnus(dewC)/magnus(tempC));
+    humidity=Math.max(0,Math.min(100,humidity));
+  }
+
+  const windText=speed!==null
+    ? ((direction==="VRB" ? "Variable" : metarNumber(direction)!==null ? String(Math.round(Number(direction))).padStart(3,"0")+"°" : "—")+
+      " · "+speed+" kt ("+(speed*1.852).toFixed(1)+" km/h)"+
+      (gust!==null ? " · Gust "+gust+" kt" : ""))
+    : "—";
+
+  const visibilityText=visibilitySm!==null
+    ? (visibilitySm*1.60934).toFixed(1)+" km"
+    : (String(item.visib ?? "").trim()==="10+" ? "16+ km" : "—");
+
+  const reportDate=metarReportDate(item.reportTime ?? item.obsTimeISO ?? item.obsTime);
+
+  return {
+    raw:raw || "Raw METAR unavailable",
+    temp:tempC,
+    dew:dewC,
+    humidity,
+    wind:windText,
+    visibility:visibilityText,
+    qnh:qnh!==null ? Math.round(qnh) : null,
+    condition,
+    time:reportDate ? reportDate.toLocaleString() : "Time not supplied",
+    source:"RotatePilot"
+  };
+}
+
+function metarWeatherIcon(condition){
+  const c=String(condition||"").toLowerCase();
+  if(c.includes("thunder")||c.includes("squall")) return "⛈️";
+  if(c.includes("rain")||c.includes("drizzle")) return "🌧️";
+  if(c.includes("snow")||c.includes("hail")) return "🌨️";
+  if(c.includes("fog")||c.includes("mist")||c.includes("haze")||c.includes("smoke")||c.includes("dust")) return "🌫️";
+  if(c.includes("cloud")||c.includes("overcast")) return "☁️";
+  return "🌤️";
+}
+
+/* =========================
    CURRENT CONDITIONS
 ========================= */
 
@@ -750,7 +915,16 @@ function renderCurrent(){
 
   const c=d.current;
   const day=d.daily;
-  const w=weather(c.weather_code,c.is_day);
+  const airport=isLahoreAirportLocation();
+  const m=airport ? state.metar : null;
+
+  const actualTemp=airport ? m?.temp : c.temperature_2m;
+  const actualCondition=airport
+    ? (m?.condition || (state.metarError ? "Airport METAR unavailable" : "Loading airport observation…"))
+    : weather(c.weather_code,c.is_day)[1];
+  const icon=airport
+    ? metarWeatherIcon(actualCondition)
+    : weather(c.weather_code,c.is_day)[0];
 
   $("locationLabel").textContent =
     state.name+(state.region ? ", "+state.region : "")+
@@ -759,12 +933,14 @@ function renderCurrent(){
 
   $("current").innerHTML=`
     <div class="now">
-      <div class="icon">${w[0]}</div>
+      <div class="icon">${icon}</div>
       <div>
-        <div class="temp">${temp(c.temperature_2m)}<span style="font-size:1.3rem">${unit()}</span></div>
-        <div class="cond">${esc(w[1])}</div>
+        <div class="temp">${actualTemp===null || actualTemp===undefined ? "—" : temp(actualTemp)}<span style="font-size:1.3rem">${actualTemp===null || actualTemp===undefined ? "" : unit()}</span></div>
+        <div class="cond">${esc(actualCondition)}</div>
         <div class="sub">
-          Feels like ${temp(c.apparent_temperature)}${unit()}<br>
+          ${airport
+            ? (m ? "Observed at OPLA · "+esc(m.time) : "Live airport observation · "+(state.metarError ? "temporarily unavailable" : "loading"))
+            : "Feels like "+temp(c.apparent_temperature)+unit()+"<br>"}
           High ${temp(day.temperature_2m_max[0])}${unit()}
           · Low ${temp(day.temperature_2m_min[0])}${unit()}
         </div>
@@ -772,29 +948,42 @@ function renderCurrent(){
     </div>`;
 
   $("sunTimes").textContent =
+    (airport && m ? "OPLA airport observation · " : "")+
     "🌅 Sunrise "+timeText(day.sunrise[0])+
     " · 🌇 Sunset "+timeText(day.sunset[0]);
 
-  const values=[
-    ["Humidity",c.relative_humidity_2m+"%"],
-    ["Wind",Math.round(c.wind_speed_10m)+" km/h "+windDirection(c.wind_direction_10m)],
-    ["Wind gusts",Math.round(c.wind_gusts_10m)+" km/h"],
-    ["Pressure",Math.round(c.pressure_msl)+" hPa"],
-    ["Cloud cover",c.cloud_cover+"%"],
-    ["UV index",Number(day.uv_index_max[0]).toFixed(1)],
-    ["Rain now",Number(c.precipitation).toFixed(1)+" mm"],
-    ["Air quality","Loading..."]
-  ];
+  let values;
+  if(airport){
+    values=[
+      ["Wind",m?.wind || (state.metarError?"Unavailable":"Loading…")],
+      ["Visibility",m?.visibility || (state.metarError?"Unavailable":"Loading…")],
+      ["QNH pressure",m?.qnh!==null && m?.qnh!==undefined ? m.qnh+" hPa" : (state.metarError?"Unavailable":"Loading…")],
+      ["Dew point",m?.dew!==null && m?.dew!==undefined ? temp(m.dew)+unit() : (state.metarError?"Unavailable":"Loading…")],
+      ["Relative humidity",m?.humidity!==null && m?.humidity!==undefined ? m.humidity+"% (calculated)" : (state.metarError?"Unavailable":"Loading…")],
+      ["METAR report",m?.time || (state.metarError?"Unavailable":"Loading…")],
+      ["Air quality","Loading..."]
+    ];
+  }else{
+    values=[
+      ["Humidity",c.relative_humidity_2m+"%"],
+      ["Wind",Math.round(c.wind_speed_10m)+" km/h "+windDirection(c.wind_direction_10m)],
+      ["Wind gusts",Math.round(c.wind_gusts_10m)+" km/h"],
+      ["Pressure",Math.round(c.pressure_msl)+" hPa"],
+      ["Cloud cover",c.cloud_cover+"%"],
+      ["UV index",Number(day.uv_index_max[0]).toFixed(1)],
+      ["Rain now",Number(c.precipitation).toFixed(1)+" mm"],
+      ["Air quality","Loading..."]
+    ];
+  }
 
   $("stats").innerHTML=values.map((v,i)=>`
     <div class="stat">
       <span>${esc(v[0])}</span>
-      <b ${i===7?'id="aqiValue"':''}>${esc(v[1])}</b>
+      <b ${i===values.length-1?'id="aqiValue"':''}>${esc(v[1])}</b>
     </div>`).join("");
 
   if(state.air) renderAir(state.air);
 }
-
 /* =========================
    WEATHER SUMMARY
 ========================= */
@@ -804,51 +993,56 @@ function renderSummary(){
   if(!d) return;
 
   const c=d.current, day=d.daily, h=d.hourly;
-  const condition=weather(c.weather_code,c.is_day)[1];
+  const airport=isLahoreAirportLocation();
+  const m=airport ? state.metar : null;
+  const condition=airport
+    ? (m?.condition || (state.metarError ? "Airport observation unavailable" : "Waiting for airport observation"))
+    : weather(c.weather_code,c.is_day)[1];
+
   const probability=Number(day.precipitation_probability_max[0]||0);
   const rainfall=Number(day.precipitation_sum[0]||0);
   const high=Number(day.temperature_2m_max[0]);
   const low=Number(day.temperature_2m_min[0]);
   const wind=Number(c.wind_speed_10m||0);
   const gust=Number(c.wind_gusts_10m||0);
+  const observedTemp=airport ? m?.temp : c.temperature_2m;
 
-  let headline=state.name+": "+condition+" and "+temp(c.temperature_2m)+unit()+".";
-  if(Number(c.weather_code)>=95){
-    headline=state.name+": Thunderstorm conditions are indicated. Follow the latest official warnings.";
-  }else if(probability>=60 && rainfall>0.1){
-    headline=state.name+": Rain is a key possibility today ("+probability+"% chance).";
-  }else if(probability>=30 && rainfall>0.1){
-    headline=state.name+": A few showers are possible today.";
-  }else if(probability<20 && rainfall<0.2){
-    headline=state.name+": Mostly dry weather is expected today.";
+  let headline;
+  if(airport){
+    headline=m
+      ? "Lahore airport now: "+condition+" and "+temp(observedTemp)+unit()+"."
+      : "Lahore airport nowcast is waiting for the latest METAR observation.";
+  }else{
+    headline=state.name+": "+condition+" and "+temp(c.temperature_2m)+unit()+".";
   }
 
   const points=[];
-  points.push("Today: "+condition+". Temperatures range from "+temp(low)+unit()+" to "+temp(high)+unit()+".");
-  if(probability>=30 || rainfall>=0.5){
-    points.push("Rain outlook: "+probability+"% chance, with about "+rainfall.toFixed(1)+" mm forecast.");
+  if(airport && m){
+    points.push("OPLA observed: "+condition+" · Wind "+m.wind+" · Visibility "+m.visibility+" · QNH "+(m.qnh!==null?m.qnh+" hPa":"—")+".");
+  }else if(airport){
+    points.push("OPLA METAR could not be loaded. Airport conditions are not being substituted with model values.");
   }else{
-    points.push("Rain outlook: Low chance ("+probability+"%); little or no rain is forecast.");
+    points.push("Current conditions: "+condition+" · "+temp(c.temperature_2m)+unit()+".");
   }
 
-  // Add a useful near-term change only when the hourly forecast supports it.
+  points.push("Forecast outlook (model data): "+probability+"% maximum rain chance today, about "+rainfall.toFixed(1)+" mm; temperatures "+temp(low)+unit()+" to "+temp(high)+unit()+".");
+
   const nowIndex=Math.max(0,h.time.findIndex(t=>t>=c.time));
   const next12=h.precipitation_probability.slice(nowIndex,nowIndex+12).map(v=>Number(v)||0);
   const next12Rain=h.precipitation.slice(nowIndex,nowIndex+12).map(v=>Number(v)||0);
   const peakChance=next12.length?Math.max(...next12):0;
   const nearRain=next12Rain.reduce((a,b)=>a+b,0);
   if(peakChance>=50 && nearRain>=0.3){
-    points.push("Next 12 hours: Shower chances increase, with peak hourly probability near "+peakChance+"%.");
-  }else if(wind>=30 || gust>=45){
-    points.push("Wind: "+Math.round(wind)+" km/h, with gusts up to "+Math.round(gust)+" km/h.");
-  }else{
-    points.push("Wind: "+Math.round(wind)+" km/h; generally light to moderate.");
+    points.push("Next 12 hours (forecast): shower chances increase, with peak hourly probability near "+peakChance+"%.");
+  }else if(!airport && (wind>=30 || gust>=45)){
+    points.push("Wind forecast: "+Math.round(wind)+" km/h, with gusts up to "+Math.round(gust)+" km/h.");
+  }else if(!airport){
+    points.push("Wind forecast: "+Math.round(wind)+" km/h; generally light to moderate.");
   }
 
   $("summaryTitle").textContent=headline;
-  $("summaryList").innerHTML=points.slice(0,2).map(x=>"<li>"+esc(x)+"</li>").join("");
+  $("summaryList").innerHTML=points.slice(0,3).map(x=>"<li>"+esc(x)+"</li>").join("");
 }
-
 /* =========================
    HOURLY FORECAST
 ========================= */
@@ -1232,7 +1426,7 @@ function initCities(){
     `).join("");
 
   $("city").addEventListener("change",e=>{
-    if(e.target.value=="") return;
+    if(e.target.value==="") return;
 
     const c=CITIES[Number(e.target.value)];
 
@@ -1410,4 +1604,3 @@ if ('serviceWorker' in navigator) {
 </script>
 </body>
 </html>
-
