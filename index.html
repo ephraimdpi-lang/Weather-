@@ -665,6 +665,10 @@ async function loadWeather(){
 
   const sequence = ++state.sequence;
 
+  // Airport observations are an independent source: start them even if
+  // Open-Meteo is slow or unavailable.
+  loadAirportMetar(sequence);
+
   $("refreshBtn").textContent = "…";
   $("refreshBtn").disabled = true;
 
@@ -697,7 +701,6 @@ async function loadWeather(){
     /* Optional data sources fail independently. */
     loadAirQuality(sequence);
     loadModels(sequence);
-    loadAirportMetar(sequence);
 
   }catch(error){
     if(sequence!==state.sequence) return;
@@ -757,47 +760,75 @@ async function loadAirportMetar(sequence){
 
   state.metar=null;
   state.metarError=false;
-  try{
-    let item=null;
-    try{
-      const primary=await fetchJSON("https://rotatepilot.com/api/v1/metar?icao=OPLA");
-      if(primary && primary.raw) item={...primary,_source:"RotatePilot"};
-      else throw new Error("Primary METAR response did not include raw report");
-    }catch(primaryError){
-      const backup=await fetchJSON("https://aviationweather.gov/api/data/metar?ids=OPLA&format=json");
-      const record=Array.isArray(backup)?backup[0]:backup;
-      if(!record || !record.rawOb) throw new Error("Backup METAR response did not include raw report");
-      item={...record,_source:"AviationWeather.gov"};
-    }
-
-    if(sequence!==state.sequence) return;
-    state.metar=normalizeAirportMetar(item);
-    state.metarError=false;
+  if(state.data){
     renderCurrent();
     renderSummary();
+  }
+
+  try{
+    // RotatePilot explicitly documents browser CORS support. The official
+    // AviationWeather.gov API currently disallows cross-origin browser calls,
+    // so it must not be used as a direct client-side fallback here.
+    const response=await fetchJSON("https://rotatepilot.com/api/v1/metar?icao=OPLA");
+    if(sequence!==state.sequence) return;
+
+    if(!response || response.icao!=="OPLA" || !response.raw){
+      throw new Error("RotatePilot returned no valid OPLA METAR report");
+    }
+
+    state.metar=normalizeAirportMetar(response);
+    state.metarError=false;
+    if(state.data){
+      renderCurrent();
+      renderSummary();
+    }
   }catch(error){
     if(sequence!==state.sequence) return;
     state.metar=null;
     state.metarError=true;
-    renderCurrent();
-    renderSummary();
+    if(state.data){
+      renderCurrent();
+      renderSummary();
+    }
     console.warn("OPLA METAR unavailable:",error);
   }
 }
 
+function metarNumber(value){
+  if(value===null || value===undefined || value==="") return null;
+  const number=Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function metarReportDate(value){
+  if(value===null || value===undefined || value==="") return null;
+
+  // RotatePilot returns ISO strings; AviationWeather's obsTime may be
+  // Unix seconds. Handle both seconds and milliseconds defensively.
+  if(typeof value==="number" || (typeof value==="string" && /^\d+(?:\.\d+)?$/.test(value))){
+    const numeric=Number(value);
+    const milliseconds=numeric<1e12 ? numeric*1000 : numeric;
+    const date=new Date(milliseconds);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  const date=new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 function normalizeAirportMetar(item){
   const raw=String(item.raw || item.rawOb || "");
-  const fromPrimary=item._source==="RotatePilot";
-  const temp=fromPrimary ? item.temperatureC : item.temp;
-  const dew=fromPrimary ? item.dewpointC : item.dewp;
-  const direction=fromPrimary ? item.windDir : item.wdir;
-  const speed=fromPrimary ? item.windSpeedKt : item.wspd;
-  const gust=fromPrimary ? item.windGustKt : item.wgst;
-  const visibilitySm=fromPrimary ? (item.visibilitySm ?? item.visibility) : item.visib;
-  const qnh=fromPrimary ? item.altimeterHpa : (
-    Number.isFinite(Number(item.altim)) ? Number(item.altim)*33.8639 : null
-  );
-  const wx=fromPrimary ? item.weather : item.wxString;
+  const tempC=metarNumber(item.temperatureC ?? item.temp);
+  const dewC=metarNumber(item.dewpointC ?? item.dewp);
+  const direction=item.windDir ?? item.wdir;
+  const speed=metarNumber(item.windSpeedKt ?? item.wspd);
+  const gust=metarNumber(item.windGustKt ?? item.wgst);
+  const visibilitySm=metarNumber(item.visibilitySm ?? item.visibility ?? item.visib);
+
+  // Both APIs expose pressure in hPa under these fields. Do not treat
+  // AviationWeather's altim value as inHg or multiply it by 33.8639.
+  const qnh=metarNumber(item.altimeterHpa ?? item.altim);
+  const wx=String(item.weather ?? item.wxString ?? "").trim();
 
   const wxNames={
     HZ:"Haze",FU:"Smoke",BR:"Mist",FG:"Fog",DU:"Dust",SA:"Sand",
@@ -808,14 +839,14 @@ function normalizeAirportMetar(item){
 
   let condition="";
   if(wx){
-    const codes=String(wx).match(/(?:\+|-)?(?:VC|MI|PR|BC|DR|BL|SH|TS|FZ)?(?:DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PY|PO|SQ|FC|SS|DS)/g) || [String(wx)];
+    const codes=wx.match(/(?:\+|-)?(?:VC|MI|PR|BC|DR|BL|SH|TS|FZ)?(?:DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PY|PO|SQ|FC|SS|DS)/g) || [wx];
     condition=[...new Set(codes.map(code=>{
       const clean=code.replace(/[+\-]/g,"");
       const found=Object.keys(wxNames).find(key=>clean.includes(key));
       return found ? wxNames[found] : code;
     }))].join(", ");
   }else{
-    const cloudCodes=raw.match(/\b(?:FEW|SCT|BKN|OVC|VV|NSC|NCD|SKC|CLR)\d{3}\b|\b(?:NSC|NCD|SKC|CLR)\b/g) || [];
+    const cloudCodes=raw.match(/\b(?:FEW|SCT|BKN|OVC|VV)\d{3}\b|\b(?:NSC|NCD|SKC|CLR)\b/g) || [];
     if(cloudCodes.some(x=>x.startsWith("OVC")||x.startsWith("VV"))) condition="Overcast";
     else if(cloudCodes.some(x=>x.startsWith("BKN"))) condition="Mostly cloudy";
     else if(cloudCodes.some(x=>x.startsWith("SCT"))) condition="Partly cloudy";
@@ -824,41 +855,36 @@ function normalizeAirportMetar(item){
     else condition="No significant weather reported";
   }
 
-  const tempC=Number(temp);
-  const dewC=Number(dew);
   let humidity=null;
-  if(Number.isFinite(tempC) && Number.isFinite(dewC)){
-    const magnus=(x)=>6.112*Math.exp((17.67*x)/(x+243.5));
+  if(tempC!==null && dewC!==null){
+    const magnus=x=>6.112*Math.exp((17.67*x)/(x+243.5));
     humidity=Math.round(100*magnus(dewC)/magnus(tempC));
     humidity=Math.max(0,Math.min(100,humidity));
   }
 
-  const windText=speed!==null && speed!==undefined
-    ? ((direction==="VRB" ? "Variable" : direction!==null && direction!==undefined ? String(direction).padStart(3,"0")+"°" : "—")+
-      " · "+speed+" kt ("+(Number(speed)*1.852).toFixed(1)+" km/h)"+
-      (gust!==null && gust!==undefined ? " · Gust "+gust+" kt" : ""))
+  const windText=speed!==null
+    ? ((direction==="VRB" ? "Variable" : metarNumber(direction)!==null ? String(Math.round(Number(direction))).padStart(3,"0")+"°" : "—")+
+      " · "+speed+" kt ("+(speed*1.852).toFixed(1)+" km/h)"+
+      (gust!==null ? " · Gust "+gust+" kt" : ""))
     : "—";
 
-  const visKm=Number(visibilitySm);
-  const visibilityText=Number.isFinite(visKm)
-    ? (visKm*1.60934).toFixed(1)+" km"
-    : "—";
+  const visibilityText=visibilitySm!==null
+    ? (visibilitySm*1.60934).toFixed(1)+" km"
+    : (String(item.visib ?? "").trim()==="10+" ? "16+ km" : "—");
 
-  const qnhNumber=Number(qnh);
-  const timeValue=item.reportTime || item.obsTime || item.obsTimeISO ||
-    (item.obsTime ? new Date(Number(item.obsTime)*1000).toISOString() : null);
+  const reportDate=metarReportDate(item.reportTime ?? item.obsTimeISO ?? item.obsTime);
 
   return {
     raw:raw || "Raw METAR unavailable",
-    temp:Number.isFinite(tempC)?tempC:null,
-    dew:Number.isFinite(dewC)?dewC:null,
+    temp:tempC,
+    dew:dewC,
     humidity,
     wind:windText,
     visibility:visibilityText,
-    qnh:Number.isFinite(qnhNumber)?Math.round(qnhNumber):null,
+    qnh:qnh!==null ? Math.round(qnh) : null,
     condition,
-    time:timeValue && !isNaN(new Date(timeValue)) ? new Date(timeValue).toLocaleString() : "Time not supplied",
-    source:item._source || "METAR"
+    time:reportDate ? reportDate.toLocaleString() : "Time not supplied",
+    source:"RotatePilot"
   };
 }
 
